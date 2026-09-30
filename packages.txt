@@ -2,10 +2,3 @@ ocrmypdf
 poppler-utils
 tesseract-ocr
 tesseract-ocr-eng
-tesseract-ocr-fra
-tesseract-ocr-deu
-tesseract-ocr-spa
-tesseract-ocr-ita
-tesseract-ocr-por
-tesseract-ocr-nld
-tesseract-ocr-lat

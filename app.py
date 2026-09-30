@@ -1,157 +1,105 @@
 """
-PDF → text, reading the text layer when there is one and OCR'ing only when there isn't.
-
-Adapted from Seek's extraction path (seek_extract.py): run `pdftotext -layout`
-first; if that yields near-empty text relative to the page count (a scanned
-PDF), fall back to OCR — here via ocrmypdf, which also returns a searchable PDF.
-The result says which path produced the text.
+Gradio front end for seek_extract (text layer first, OCR for scans) plus the
+optional local vision-model pass in vlm_pages.
 """
 
 from __future__ import annotations
 
-import shutil
-import subprocess
+import os
 import tempfile
 from pathlib import Path
 
+# On a Hugging Face Space, keep the cache in scratch space, not the app dir.
+ON_SPACE = bool(os.environ.get("SPACE_ID"))
+if ON_SPACE:
+    os.environ.setdefault("SEEK_EXTRACT_CACHE", str(Path(tempfile.gettempdir()) / "seek-extract"))
+
 import gradio as gr
 
-MAX_MB = 50
-MAX_PAGES = 60
-PDFTOTEXT_TIMEOUT = 120   # seconds
-OCR_TIMEOUT = 600         # seconds
+import vlm_pages
+from seek_extract import CACHE_DIR, ExtractError, _page_count, extract
 
-# Chars of extracted text per page below which we assume a scanned PDF.
-MIN_CHARS_PER_PAGE = 100
+MAX_PAGES = 60  # app-level cap so one upload can't tie up a shared Space
 
-LANG_NAMES = {
-    "eng": "English", "fra": "French", "deu": "German", "spa": "Spanish",
-    "ita": "Italian", "por": "Portuguese", "nld": "Dutch", "lat": "Latin",
-}
+VLM_OK, VLM_WHY = vlm_pages.available()
 
 
-class ExtractError(RuntimeError):
-    pass
-
-
-def _run(cmd: list[str], timeout: int) -> subprocess.CompletedProcess:
-    try:
-        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-    except subprocess.TimeoutExpired:
-        raise ExtractError(f"{cmd[0]} timed out after {timeout} s")
-
-
-def installed_langs() -> list[str]:
-    try:
-        out = _run(["tesseract", "--list-langs"], timeout=20).stdout
-    except (ExtractError, FileNotFoundError):
-        return ["eng"]
-    langs = [l.strip() for l in out.splitlines()[1:] if l.strip()]
-    return [l for l in langs if l not in ("osd", "snum")] or ["eng"]
-
-
-def page_count(pdf: Path) -> int:
-    proc = _run(["pdfinfo", str(pdf)], timeout=PDFTOTEXT_TIMEOUT)
-    if proc.returncode != 0:
-        raise ExtractError("could not read the PDF (is it damaged or encrypted?)")
-    for line in proc.stdout.splitlines():
-        if line.startswith("Pages:"):
-            return int(line.split()[1])
-    raise ExtractError("could not determine the page count")
-
-
-def pdftotext(pdf: Path, txt: Path) -> str:
-    proc = _run(["pdftotext", "-layout", str(pdf), str(txt)], timeout=PDFTOTEXT_TIMEOUT)
-    if proc.returncode != 0:
-        raise ExtractError(f"pdftotext failed: {proc.stderr.strip()[:300]}")
-    return txt.read_text(errors="replace")
-
-
-def ocr(pdf: Path, out_pdf: Path, sidecar: Path, langs: str) -> str:
-    proc = _run(
-        ["ocrmypdf", "--force-ocr", "--rotate-pages", "--deskew",
-         "--language", langs, "--jobs", "2",
-         "--sidecar", str(sidecar), str(pdf), str(out_pdf)],
-        timeout=OCR_TIMEOUT,
-    )
-    if proc.returncode != 0:
-        tail = proc.stderr.strip().splitlines()[-3:]
-        raise ExtractError("ocrmypdf failed: " + " / ".join(tail)[:400])
-    # ocrmypdf separates pages in the sidecar with form feeds.
-    return sidecar.read_text(errors="replace").replace("\f", "\n\n")
-
-
-def extract(file_path: str | None, langs: list[str], force_ocr: bool):
+def run(file_path: str | None, use_vlm: bool, threshold: float,
+        progress=gr.Progress()):
     if not file_path:
         raise gr.Error("Upload a PDF first.")
-    src = Path(file_path)
-    if src.stat().st_size > MAX_MB * 1024 * 1024:
-        raise gr.Error(f"File is over the {MAX_MB} MB limit.")
-    with src.open("rb") as f:
-        if f.read(5) != b"%PDF-":
-            raise gr.Error("That file isn't a PDF.")
+    pages = _page_count(Path(file_path))
+    if pages > MAX_PAGES:
+        raise gr.Error(f"{pages} pages is over the {MAX_PAGES}-page limit.")
 
-    work = Path(tempfile.mkdtemp(prefix="ocr-"))
-    pdf = work / "input.pdf"
-    shutil.copyfile(src, pdf)
-    stem = src.stem or "document"
-
+    progress(0, desc="Extracting")
     try:
-        pages = page_count(pdf)
-        if pages > MAX_PAGES:
-            raise gr.Error(f"{pages} pages is over the {MAX_PAGES}-page limit.")
+        info = extract(file_path)
+        text = Path(info["text_path"]).read_text(errors="replace")
+        status = (f"**Method: {info['method']}** · {info['page_count']} pages · "
+                  f"sha256 `{info['sha256'][:12]}`")
 
-        text = pdftotext(pdf, work / "layer.txt")
-        chars_per_page = len(text.strip()) / max(pages, 1)
-        searchable = None
-
-        if force_ocr or chars_per_page < MIN_CHARS_PER_PAGE:
-            reason = ("OCR forced" if force_ocr else
-                      f"text layer too thin ({chars_per_page:.0f} chars/page)")
-            searchable = work / f"{stem}-searchable.pdf"
-            text = ocr(pdf, searchable, work / "sidecar.txt", "+".join(langs or ["eng"]))
-            status = f"**Method: OCR** ({reason}; languages: {'+'.join(langs or ['eng'])}) · {pages} pages"
-        else:
-            status = (f"**Method: text layer** (pdftotext, {chars_per_page:.0f} chars/page, "
-                      f"no OCR needed) · {pages} pages")
-
-        txt_out = work / f"{stem}.txt"
-        txt_out.write_text(text)
-        return status, text, str(txt_out), (str(searchable) if searchable else None)
+        if use_vlm and VLM_OK and info["method"] == "ocr":
+            text, report = vlm_pages.refine(info["pdf_path"], text, threshold, progress)
+            redone = [r for r in report if r["method"] == "vlm"]
+            if redone:
+                status += (f"\n\n**Vision model ({vlm_pages.model_name()})** re-read "
+                           f"{len(redone)} of {len(report)} pages: " +
+                           ", ".join(f"p{r['page']} (conf {r['confidence']:.0f})" for r in redone))
+            else:
+                status += (f"\n\nAll pages scored ≥ {threshold:.0f} Tesseract confidence; "
+                           "no vision-model pass needed.")
+        elif use_vlm and VLM_OK and info["method"] != "ocr":
+            status += "\n\nText layer was used, so there was nothing for the vision model to do."
     except ExtractError as e:
         raise gr.Error(str(e))
+    finally:
+        # On the shared Space, don't keep people's documents around.
+        if ON_SPACE and "info" in locals():
+            for k in ("pdf_path", "text_path"):
+                Path(info[k]).unlink(missing_ok=True)
+
+    text = text.replace("\f", "\n\n")
+    out = Path(tempfile.mkdtemp()) / f"{Path(file_path).stem or 'document'}.txt"
+    out.write_text(text)
+    return status, text, str(out)
 
 
-LANGS = installed_langs()
+if VLM_OK:
+    vlm_note = f"Local vision model available: **{vlm_pages.model_name()}** (via Ollama)."
+elif ON_SPACE:
+    vlm_note = ("The vision-model step runs only on your own machine. Duplicate or clone this "
+                "Space, pull a vision model in [Ollama](https://ollama.com), and set "
+                "`OCR_VLM_MODEL` (see the README).")
+else:
+    vlm_note = f"Vision-model step off: {VLM_WHY}."
 
 with gr.Blocks(title="PDF OCR") as demo:
     gr.Markdown(
         "# PDF → text\n"
-        "Reads the PDF's own text layer when it has one (fast and exact). "
-        "If the PDF is a scan, runs OCR with [OCRmyPDF](https://ocrmypdf.readthedocs.io) "
-        "and Tesseract, and also gives you back a searchable PDF.\n\n"
-        f"Limits: {MAX_MB} MB, {MAX_PAGES} pages. "
-        "Uploaded files are processed on Hugging Face's servers and are not kept after the request."
+        "1. Reads the PDF's own text layer when it has one (`pdftotext`, fast and exact).\n"
+        "2. If the PDF is a scan, runs OCR (`ocrmypdf` / Tesseract).\n"
+        "3. Optionally, pages Tesseract was unsure about are re-read by a **local** vision model.\n\n"
+        f"{vlm_note}\n\n"
+        f"Limit: {MAX_PAGES} pages."
+        + (" Uploads are processed on Hugging Face's servers and deleted after each request."
+           if ON_SPACE else "")
     )
     with gr.Row():
         with gr.Column(scale=1):
             file_in = gr.File(label="PDF", file_types=[".pdf"], type="filepath")
-            langs_in = gr.Dropdown(
-                choices=[(LANG_NAMES.get(l, l), l) for l in LANGS],
-                value=["eng"] if "eng" in LANGS else LANGS[:1],
-                multiselect=True, label="OCR language(s)",
-            )
-            force_in = gr.Checkbox(label="Force OCR (ignore the existing text layer)")
+            vlm_in = gr.Checkbox(label="Re-read hard pages with the local vision model",
+                                 value=VLM_OK, visible=VLM_OK)
+            thr_in = gr.Slider(40, 95, value=vlm_pages.DEFAULT_THRESHOLD, step=5,
+                               label="Escalate pages below this Tesseract confidence",
+                               visible=VLM_OK)
             go = gr.Button("Extract text", variant="primary")
         with gr.Column(scale=2):
             status_out = gr.Markdown()
             text_out = gr.Textbox(label="Text", lines=20, max_lines=40, buttons=["copy"])
-            with gr.Row():
-                txt_file_out = gr.File(label="Text file")
-                pdf_file_out = gr.File(label="Searchable PDF (OCR only)")
+            file_out = gr.File(label="Text file")
 
-    go.click(extract, [file_in, langs_in, force_in],
-             [status_out, text_out, txt_file_out, pdf_file_out])
+    go.click(run, [file_in, vlm_in, thr_in], [status_out, text_out, file_out])
 
 demo.queue(default_concurrency_limit=2)
 
