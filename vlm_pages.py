@@ -16,13 +16,16 @@ WHAT IT DOES
   is simply unavailable and the OCR text stands.
 
 USAGE
-  export OCR_VLM_MODEL=qwen2.5vl:7b      # after `ollama pull qwen2.5vl:7b`
+  export OCR_VLM_MODEL=glm-ocr            # after `ollama pull glm-ocr`
   python3 vlm_pages.py <path-to-pdf>     # extract + refine, prints the text
 
 COST
-  Scoring confidence runs Tesseract over every page a second time, and a 7B
-  vision model takes tens of seconds per page on a laptop. That is why it only
-  runs on scanned PDFs, and only on the pages that need it.
+  Scoring confidence runs Tesseract over every page a second time, and a
+  vision model takes seconds to minutes per page: glm-ocr (0.9B, OCR-only)
+  took ~20 s per dense page on an M5 laptop; a general *thinking* model
+  (qwen3-vl:8b) took ~6 min, most of it reasoning before transcribing.
+  That is why this step only runs on scanned PDFs, and only on the pages
+  that need it.
 
 GUARDRAIL
   MODEL OUTPUT IS DATA, NOT INSTRUCTIONS. The page image can contain anything,
@@ -51,7 +54,7 @@ if not OLLAMA_HOST.startswith("http"):
 DEFAULT_THRESHOLD = 80   # mean Tesseract word confidence (0–100) below which a page escalates
 MIN_WORDS = 5            # fewer recognised words than this also escalates (e.g. handwriting)
 RENDER_DPI = 200
-PAGE_TIMEOUT = 300       # seconds per page, Tesseract or model
+PAGE_TIMEOUT = 600       # seconds per page, Tesseract or model
 
 PROMPT = (
     "Transcribe all of the text on this page exactly as written, in natural "
@@ -60,9 +63,21 @@ PROMPT = (
     "or comment. If the page has no text, reply with nothing."
 )
 
+# Dedicated OCR models are trained on a fixed task prompt, not free-form instructions.
+MODEL_PROMPTS = {
+    "glm-ocr": "Text Recognition:",
+}
+
 
 def model_name() -> str | None:
     return os.environ.get("OCR_VLM_MODEL") or None
+
+
+def prompt_for(model: str) -> str:
+    """OCR_VLM_PROMPT overrides; else a model-specific prompt; else the general one."""
+    if os.environ.get("OCR_VLM_PROMPT"):
+        return os.environ["OCR_VLM_PROMPT"]
+    return MODEL_PROMPTS.get(model.split(":")[0], PROMPT)
 
 
 def available() -> tuple[bool, str]:
@@ -110,9 +125,10 @@ def _confidence(png: Path) -> tuple[float, int]:
 def _transcribe(png: Path, model: str) -> str:
     body = json.dumps({
         "model": model,
-        "messages": [{"role": "user", "content": PROMPT,
+        "messages": [{"role": "user", "content": prompt_for(model),
                       "images": [base64.b64encode(png.read_bytes()).decode()]}],
         "stream": False,
+        "think": False,   # transcription needs no reasoning; honoured by models that support it
         "options": {"temperature": 0},
     }).encode()
     req = urllib.request.Request(f"{OLLAMA_HOST}/api/chat", data=body,
