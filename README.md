@@ -8,7 +8,7 @@ sdk_version: "6.29.0"
 app_file: app.py
 pinned: false
 license: mit
-short_description: PDF to text; OCR for scans, local vision model for hard pages
+short_description: PDF to text; OCR for scans, local VLM for hard pages
 ---
 
 # PDF OCR
